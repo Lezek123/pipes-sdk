@@ -158,6 +158,15 @@ ordering_key, id, op, payload)`. An older schema version is refused rather than 
 place, and a state file that started empty is refused unless `allowColdStart` declares the
 bootstrap (E2420, CN-46).
 
+The `meta` key `folded_through` holds the highest finalized block that the producer folded
+into the baselines. The CN-17 prune does not delete rows. It only moves this key up. An
+implementation MUST ignore these pruned rows until it deletes them:
+
+- a `manifest` or `ledger_blocks` row at or below `folded_through`
+- a `rollback_inverse` row whose id has no `manifest` row above `folded_through`.
+
+A new `rollback_inverse` row for such an id replaces the pruned one.
+
 Each payload is a plain-object BigQuery CDC row containing the author's columns plus
 target-owned `_id`, `_CHANGE_TYPE` (`UPSERT` | `DELETE`), and
 `_CHANGE_SEQUENCE_NUMBER` (the producer-wide integer sequence in uppercase hexadecimal,
