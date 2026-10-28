@@ -40,8 +40,9 @@ cursor. Recovery: on every resume the sink invokes the repair hook (`recovery`, 
 cursor) which MUST remove rows above the cursor before streaming resumes. Delivery:
 at-least-once at the storage layer, effectively exactly-once **iff** the repair
 obligation (RP-42) is met. *(Hook optional by design — the binding is schema-blind; its
-absence is warned, not repaired: an accepted deviation, ADR-15. With no cursor persisted
-yet, the hook is never called, so a crash in the first batch is not repaired — GAP-44.)*
+absence is warned, not repaired: an accepted deviation, ADR-15. So that a crash in the first
+batch leaves a cursor for the hook to start above, the binding appends a start cursor, one block
+below the range start, before the batch's data; the same ADR.)*
 
 **CN-14 — Class ∅ (ephemeral).** No persistence; every run is a cold start; only
 rows delivered by the finalized-only route are emitted to author code, immediately.
@@ -122,7 +123,8 @@ units are never touched. A fork response on that route is a portal-contract viol
 and halts safely before further publication (WP-45, FM-13).
 
 **CN-33 — A.** Fork resolves the ancestor from own-key rollback records, then delegates
-deletion to the repair hook (`fork`, ancestor). The storage-level mechanism MUST be
+deletion to the repair hook (`fork`, ancestor), bounded above by the cursor it rolls back from:
+the pipe's rows lie at or below it. The storage-level mechanism MUST be
 idempotent under duplicated application and MUST NOT corrupt tables that share the
 store (engine-capability guards at startup).
 
@@ -170,12 +172,13 @@ integrity error — before modifying anything.
 is absent but tracked tables contain data (state deleted, wrong key, half-migration),
 the sink refuses with a coded error rather than restarting from scratch and duplicating
 history. Applies only where the binding declares its tracked tables **exclusive** to one
-cursor key (IB-27). On tables shared with co-resident pipes the condition is
+cursor key (IB-27; ADR-16). On tables shared with co-resident pipes the condition is
 undecidable — "table non-empty" is not evidence of *orphan* data, the rows may belong to
 another key — and probing them would make one pipe's startup depend on another's data,
-contrary to INV-35; a sink over shared tables MUST NOT run the guard. *(The one
-implementation probes table-wide and so refuses a legitimate first run into a populated
-shared table — GAP-20; exclusivity model ADR-16/OQ-8.)*
+contrary to INV-35; a sink over shared tables MUST NOT run the guard. *(The write-ahead
+binding probes table-wide and so refuses a legitimate first run into a populated shared
+table — GAP-20; the file binding refuses another key's state but starts afresh over data
+with no state at all — GAP-41.)*
 
 **CN-45 — Cross-implementation recovery.** [MUST] Recovery reads state via the formats
 of IB-20…IB-28 only; any conforming implementation recovers state written by any other

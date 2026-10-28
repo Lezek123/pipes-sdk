@@ -139,6 +139,8 @@ type ManifestDbRow = {
 const META_SEQUENCE = 'sequence'
 const META_CURSOR_KEY = 'cursor_key'
 const META_MATERIALIZED_ID_SOURCE = 'materialized_id_source:'
+/** The target owns this value; it is declared here so a schema migration can rewrite it. */
+export const META_WIRE_CONFIG = 'wire_config'
 /**
  * The highest finalized block whose manifest rows are already folded into baselines. Rows at or
  * below it are dead: every read skips them, and compaction deletes them in small chunks.
@@ -231,6 +233,26 @@ const ROLLED_BACK = {
     'Only the cleanup of already finalized rows was rolled back; it runs again when the finalized head next moves.',
 } as const
 
+/**
+ * Schema 3 stored `[namespace, uidAttribute, messageOrdering, encoders]`, keying each encoder by
+ * route kind (`cdc:`, `signal:`). Schema 4 keys CDC routes by bare stream and adds producer-wide
+ * attributes, which schema 3 had none of.
+ */
+function wireConfigV4(stored: string): string {
+  const [namespace, uidAttribute, messageOrdering, encoders = []] = JSON.parse(stored) as [
+    string,
+    boolean,
+    boolean,
+    [string, string][]?,
+  ]
+
+  const cdcEncoders = encoders
+    .filter(([key]) => !key.startsWith('signal:'))
+    .map(([key, kind]) => [key.replace(/^cdc:/, ''), kind])
+
+  return JSON.stringify([namespace, uidAttribute, messageOrdering, stableAttributes({}), cdcEncoders])
+}
+
 export class SqlitePubsubState implements PubsubState {
   readonly #options: SqlitePubsubStateOptions
   readonly #key: CursorKey
@@ -296,7 +318,12 @@ export class SqlitePubsubState implements PubsubState {
       this.#lock()
       this.#initializeSchema()
 
-      const version = this.getMetaSync('schema_version')
+      let version = this.getMetaSync('schema_version')
+      if (version === '3') {
+        this.#migrateV3ToV4()
+        version = STATE_SCHEMA_VERSION
+      }
+
       if (version && version !== STATE_SCHEMA_VERSION) {
         throw new PubsubTargetError(PUBSUB_ERROR_CODES.STATE_SCHEMA_VERSION, [
           `The PubSub state at "${this.#options.path}" was written with schema version ${version}, ` +
@@ -490,6 +517,36 @@ export class SqlitePubsubState implements PubsubState {
           payload       BLOB,
           PRIMARY KEY (topic, ordering_key, id)
         )`)
+    })
+  }
+
+  /**
+   * Schema 4 differs only in what signal routes stored, so a CDC producer's file migrates in
+   * place and keeps its change sequence. Fresh state would restart that sequence under a
+   * namespace consumers already read.
+   */
+  #migrateV3ToV4(): void {
+    const db = this.#db!
+
+    this.#transaction('BEGIN IMMEDIATE', ROLLED_BACK.schema, () => {
+      const signals = db.get<{ n: number }>("SELECT COUNT(*) AS n FROM outbox WHERE kind = 'signal'")?.n ?? 0
+      if (signals > 0) {
+        throw new PubsubTargetError(PUBSUB_ERROR_CODES.STATE_SCHEMA_VERSION, [
+          `The PubSub state at "${this.#options.path}" was written with schema version 3 and still holds ` +
+            `${signals} unpublished signal operation(s). Schema ${STATE_SCHEMA_VERSION} has no signal routes to publish them.`,
+          'Drain the outbox with the SDK version that wrote the state, then upgrade.',
+        ])
+      }
+
+      db.exec('ALTER TABLE outbox DROP COLUMN kind')
+      db.exec("DELETE FROM meta WHERE key = 'fork_epoch'")
+
+      const wireConfig = this.getMetaSync(META_WIRE_CONFIG)
+      if (wireConfig !== undefined) {
+        this.setMetaSync(META_WIRE_CONFIG, wireConfigV4(wireConfig))
+      }
+
+      this.setMetaSync('schema_version', STATE_SCHEMA_VERSION)
     })
   }
 

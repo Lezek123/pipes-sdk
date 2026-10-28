@@ -1,8 +1,6 @@
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect } from 'vitest'
 
 import { BlockCursor } from '~/core/index.js'
 import { SqliteOptions, SqliteSync, loadSqlite } from '~/drivers/sqlite/sqlite.js'
@@ -16,6 +14,7 @@ import {
   PendingOperation,
   SqlitePubsubState,
 } from './pubsub-state.js'
+import { downgradeToSchemaV3, inspectStateFile, withStatePath } from './test-support.js'
 
 const encoder = new TextEncoder()
 const text = (bytes: Uint8Array) => new TextDecoder().decode(bytes)
@@ -74,16 +73,17 @@ type OpenOptions = {
 type OpenState = (options?: OpenOptions) => Promise<{ state: SqlitePubsubState; coldStart: boolean }>
 
 /**
- * A test with an `openState` fixture. Every call opens the test's state file again (or `file`),
- * and every state it opens is closed, and the directory removed, when the test ends.
+ * A test with an `openState` fixture. Every call opens the test's state file (`statePath`) again,
+ * or `file` next to it, and every state it opens is closed when the test ends. `withStatePath`
+ * then removes the directory.
  */
-const withStateFile = it.extend<{ openState: OpenState }>({
-  openState: async ({}, use) => {
-    const dir = mkdtempSync(join(tmpdir(), 'pubsub-state-'))
+const withStateFile = withStatePath.extend<{ openState: OpenState }>({
+  openState: async ({ statePath }, use) => {
     const opened: SqlitePubsubState[] = []
 
-    await use(async ({ driver, cursorKey = 'test-pipe', allowColdStart, file = 'state' } = {}) => {
-      const state = new SqlitePubsubState({ path: join(dir, `${file}.sqlite`), [INTERNAL_DRIVER]: driver })
+    await use(async ({ driver, cursorKey = 'test-pipe', allowColdStart, file } = {}) => {
+      const path = file ? join(dirname(statePath), `${file}.sqlite`) : statePath
+      const state = new SqlitePubsubState({ path, [INTERNAL_DRIVER]: driver })
       const { coldStart } = await state.open({ cursorKey, logger: testLogger(), allowColdStart })
       opened.push(state)
 
@@ -93,7 +93,6 @@ const withStateFile = it.extend<{ openState: OpenState }>({
     for (const state of opened) {
       await state.close()
     }
-    rmSync(dir, { recursive: true, force: true })
   },
 })
 
@@ -287,13 +286,89 @@ describe('SqlitePubsubState', () => {
     expect(retry.coldStart).toBe(false)
   })
 
-  // No in-place migration: a file another version wrote is refused rather than guessed at.
-  withStateFile('refuses a state file written by another schema version', async ({ openState }) => {
+  // Only schema 3 migrates in place; anything older is refused rather than guessed at.
+  withStateFile('refuses a state file written by a schema it cannot migrate', async ({ openState }) => {
     const first = await openState()
-    await first.state.setMeta('schema_version', '1')
+    await first.state.setMeta('schema_version', '2')
     await first.state.close()
 
-    await expect(openState()).rejects.toBeInstanceOf(PubsubTargetError)
+    await expect(openState()).rejects.toMatchObject({ code: PUBSUB_ERROR_CODES.STATE_SCHEMA_VERSION })
+  })
+
+  describe('schema 3 migration', () => {
+    withStateFile('keeps the change sequence and the unconfirmed outbox', async ({ statePath, openState }) => {
+      const first = await openState()
+      await commit(first.state, { operations: [operation()], ledger: [], cursor: block(100), finalized: null })
+      await first.state.confirm((await first.state.pending()).map((row) => row.rowId))
+      await commit(first.state, {
+        operations: [operation({ id: 'row-2' })],
+        ledger: [],
+        cursor: block(101),
+        finalized: null,
+      })
+      await first.state.close()
+      await downgradeToSchemaV3(statePath)
+
+      const migrated = await openState()
+      expect(migrated.coldStart).toBe(false)
+      expect(await migrated.state.getCursor()).toMatchObject({ latest: { number: 101 } })
+
+      await commit(migrated.state, {
+        operations: [operation({ id: 'row-3' })],
+        ledger: [],
+        cursor: block(102),
+        finalized: null,
+      })
+      const sequenced = (await migrated.state.pending()).map((row) => [row.id, row.seq])
+      expect(sequenced).toEqual([
+        ['row-2', 2],
+        ['row-3', 3],
+      ])
+    })
+
+    withStateFile('leaves the file in the shape schema 4 creates', async ({ statePath, openState }) => {
+      const first = await openState()
+      await first.state.close()
+      await downgradeToSchemaV3(statePath)
+
+      const migrated = await openState()
+      await migrated.state.close()
+
+      const file = await inspectStateFile(statePath)
+      expect(file).toMatchObject({ schemaVersion: '4', forkEpoch: undefined })
+      expect(file.outboxColumns).not.toContain('kind')
+    })
+
+    withStateFile('rewrites the wire config the way schema 4 stores it', async ({ statePath, openState }) => {
+      const wireConfig = JSON.stringify(['test-pipe', true, false, '{}', [['transfers', 'canonical']]])
+
+      const first = await openState()
+      await first.state.setMeta('wire_config', wireConfig)
+      await first.state.close()
+      await downgradeToSchemaV3(statePath, { signalRoutes: ['events'] })
+
+      const { state } = await openState()
+
+      expect(await state.getMeta('wire_config')).toBe(wireConfig)
+    })
+
+    // Schema 4 has no signal routes, so nothing could ever publish those rows.
+    withStateFile(
+      'refuses unpublished signal operations and leaves the file as it was',
+      async ({ statePath, openState }) => {
+        const first = await openState()
+        await commit(first.state, { operations: [operation()], ledger: [], cursor: block(100), finalized: null })
+        const [signal] = await first.state.pending()
+        await first.state.close()
+        await downgradeToSchemaV3(statePath, { signalRowIds: [signal.rowId] })
+
+        await expect(openState()).rejects.toMatchObject({ code: PUBSUB_ERROR_CODES.STATE_SCHEMA_VERSION })
+
+        const file = await inspectStateFile(statePath)
+        expect(file).toMatchObject({ schemaVersion: '3', forkEpoch: '0' })
+        expect(file.outboxColumns).toContain('kind')
+      },
+    )
   })
 
   describe('fork compensation', () => {

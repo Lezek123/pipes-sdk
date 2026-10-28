@@ -267,7 +267,7 @@ The table has no `sign` column, so cancel-row rollback cannot work.
 
 ### E2006 · Invalid rollback index column
 
-The column passed to `ensureRollbackIndex` is not a plain identifier.
+The column passed to `ensureRollbackIndex` or `removeRowsAfter` is not a plain identifier.
 
 **Fix** — pass a plain identifier (letters, digits, underscores; no spaces or expressions).
 
@@ -278,10 +278,9 @@ written above the fork point cannot be removed. Returning a rewound cursor witho
 would leave diverged data, so the target refuses instead. On the hot stream a startup warning
 announces this risk before a fork ever arrives.
 
-**Fix** — configure `onRollback` on the ClickHouse target. The typical implementation calls
-`store.removeAllRows` with `where: 'block_number > {latest:UInt32}'` and
-`params: { latest: safeCursor.number }`. A pipe reading `/finalized-stream` never forks and does
-not need one.
+**Fix** — configure `onRollback` on the ClickHouse target. The typical implementation is
+`store.removeRowsAfter(safeCursor, { tables })`. A pipe reading `/finalized-stream` never forks
+and does not need one.
 
 ---
 
@@ -421,8 +420,7 @@ target refuses to start.
 
 **Fix** — if you deliberately reset the sync table, also `TRUNCATE`/drop the tracked tables it names.
 If you're upgrading from a pre-`id`-keyed cursor, keep the old cursor by pinning
-`settings: { state: { id: 'stream' } }` — see the
-[migration guide](https://github.com/subsquid-labs/pipes-sdk/blob/main/packages/pipes/MIGRATION.md#10-target-cursors-are-now-keyed-by-the-pipe-id).
+`settings: { state: { id: 'stream' } }`.
 
 ### E2213 · BigQuery rejected rows in AppendRows
 
@@ -593,6 +591,21 @@ file with wrong contents is beyond it.
 the footer) to the temp path it was given before resolving `finish()`. The built-in
 `parquetjsEngine` cannot produce this error.
 
+### E2321 · Output directory belongs to another pipe
+
+A Parquet output directory belongs to one pipe. Data files carry no pipe id, so crash recovery
+cannot tell another pipe's files from its own: it would delete that pipe's temp files and its
+published files above this pipe's cursor. At startup, before it touches any file, the target refuses
+a directory that holds a state file under a key other than its own — `_sqd_parquet_state.<other>.json`
+or the id-less `_sqd_parquet_state.json`. The message names the files it found and the one this pipe
+expects.
+
+**Fix** — give each pipe its own `dir`. To split a directory that two pipes already share, stop both
+and move one pipe's state file and its table directories to a new directory; if both wrote the same
+table, its files cannot be told apart, so re-index that pipe into its new directory instead. If the
+state file is this pipe's own under an old key — the source `id` or `settings.id` changed, or the
+state predates pipe ids — rename it to the name the message gives, and the pipe resumes from it.
+
 ---
 
 ## Google PubSub target
@@ -687,11 +700,15 @@ numbers they already hold.
 
 ### E2411 · State schema version mismatch
 
-The state file was written by a different schema version of the target. State schemas are not
-migrated in place.
+The state file was written by a schema version of the target that this build cannot open. A
+schema 3 file, written by `1.0.0-beta.4`, is migrated in place on first open and keeps its change
+sequence. It is refused only while its outbox still holds signal operations, because signal routes
+no longer exist. Other schema versions are not migrated.
 
-**Fix** — run the SDK version that owns the state, or start a fresh state and re-bootstrap the
-destination. A new state file is a new sequencer; see the cold-start warning in the target's logs.
+**Fix** — for a schema 3 file with pending signal operations, let the SDK version that wrote it
+drain the outbox, then upgrade. For any other version, run the SDK version that owns the state, or
+start a fresh state and re-bootstrap the destination. A new state file is a new sequencer; see the
+cold-start warning in the target's logs.
 
 ### E2412 · Ordering key while message ordering is disabled
 
